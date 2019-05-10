@@ -4,8 +4,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import requests
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 
 
@@ -15,7 +19,7 @@ TOKEN = None
 
 
 def api_request(endpoint, method='GET', data=None):
-    url = '%s/secrets/v1/%s' % (BASE_URL.rstrip('/'), endpoint)
+    url = '%s/%s' % (BASE_URL.rstrip('/'), endpoint)
     headers = {
         'Authorization': 'token=%s' % TOKEN,
     }
@@ -45,20 +49,27 @@ def api_request(endpoint, method='GET', data=None):
 
 
 def get_secret(secret_name):
-    r = api_request('secret/default/%s' % secret_name)
+    r = api_request('secrets/v1/secret/default/%s' % secret_name)
     return r.json().get('value', None)
 
 
 def create_secret(secret_name, value):
-    r = api_request('secret/default/%s' % secret_name, method='PUT', data={'value': value})
+    r = api_request('secrets/v1/secret/default/%s' % secret_name, method='PUT', data={'value': value})
     if r.status_code == 201:
         return True
     return False
 
 
 def update_secret(secret_name, value):
-    r = api_request('secret/default/%s' % secret_name, method='PATCH', data={'value': value})
+    r = api_request('secrets/v1/secret/default/%s' % secret_name, method='PATCH', data={'value': value})
     if r.status_code == 204:
+        return True
+    return False
+
+
+def create_service_account(account_name, public_key):
+    r = api_request('acs/api/v1/users/%s' % account_name, method='PUT', data={'public_key': public_key})
+    if r.status_code == 201:
         return True
     return False
 
@@ -66,6 +77,22 @@ def update_secret(secret_name, value):
 def generate_password():
     now = time.time()
     return hashlib.md5(str(now)).hexdigest()
+
+
+def generate_keypair():
+    tmpdir = tempfile.mkdtemp()
+    if DEBUG:
+        print('Creating private key at %s/private.pem' % tmpdir)
+    subprocess.check_call('openssl genrsa -out %s/private.pem 2048' % tmpdir, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if DEBUG:
+        print('Creating public key at %s/public.pem' % tmpdir)
+    subprocess.check_call('openssl rsa -in %s/private.pem -outform PEM -pubout -out %s/public.pem' % (tmpdir, tmpdir), shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    private_key = open('%s/private.pem' % tmpdir).read()
+    public_key = open('%s/public.pem' % tmpdir).read()
+    if DEBUG:
+        print('Removing temporary directory %s' % tmpdir)
+    shutil.rmtree(tmpdir)
+    return (private_key, public_key)
 
 
 def main():
@@ -147,6 +174,24 @@ def main():
                         sys.exit(1)
                 else:
                     print('Secret already exists...nothing to do')
+        elif secret['type'] == 'service_account':
+            current_value = get_secret(secret['name'])
+            if current_value is None:
+                private_key, public_key = generate_keypair()
+                account_name = re.sub('[^-_a-zA-Z0-9]', '_', secret['name'])
+                if not create_service_account(account_name, public_key):
+                    print('Failed to create service account')
+                    sys.exit(1)
+                # This matches the structure created by the 'dcos security secrets create-sa-secret' command
+                secret_data = {
+                    'login_endpoint': 'https://leader.mesos/acs/api/v1/auth/login',
+                    'private_key': private_key,
+                    'scheme': 'RS256',
+                    'uid': account_name,
+                }
+                if not create_secret(secret['name'], json.dumps(secret_data)):
+                    print('Failed to create secret')
+                    sys.exit(1)
         else:
             print('Unsupported secret type: %s' % secret['type'])
             sys.exit(1)
